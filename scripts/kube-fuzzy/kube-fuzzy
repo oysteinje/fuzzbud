@@ -1,0 +1,302 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ── Colors ──────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+GRAY='\033[90m'
+NC='\033[0m'
+
+# ── Helpers ─────────────────────────────────────────────────────────
+die() {
+    local msg="$1"
+    local code="${2:-1}"
+    printf "${RED}Error: %s${NC}\n" "$msg" >&2
+    exit "$code"
+}
+
+check_deps() {
+    local missing=()
+    local deps=(fzf kubectl)
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &>/dev/null; then
+            missing+=("$dep")
+        fi
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        die "Missing required dependencies: $(IFS=', '; echo "${missing[*]}")"
+    fi
+}
+
+show_spinner() {
+    local pid="$1"
+    local message="$2"
+    local frames=('|' '/' '-' '\')
+    local i=0
+    while kill -0 "$pid" 2>/dev/null; do
+        printf "\r%s %s" "$message" "${frames[i % ${#frames[@]}]}"
+        i=$(( i + 1 ))
+        sleep 0.1
+    done
+    wait "$pid"
+    local status=$?
+    printf "\r\033[K"
+    return "$status"
+}
+
+# ── fzf setup ───────────────────────────────────────────────────────
+_fzf_ver=$(fzf --version 2>/dev/null | awk '{print $1}')
+if printf '%s\n' "0.30.0" "$_fzf_ver" | sort -V -C 2>/dev/null; then
+    FZF_COMMON=(--height=~50% --border --margin=1,2 --ansi)
+else
+    FZF_COMMON=(--height=50% --border --margin=1,2 --ansi)
+fi
+unset _fzf_ver
+FZF_SINGLE=("${FZF_COMMON[@]}" --no-multi)
+
+# ── Namespace picker ────────────────────────────────────────────────
+pick_namespace() {
+    local ns
+    ns=$(kubectl get namespaces -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
+        | fzf "${FZF_SINGLE[@]}" --header="Select namespace" --prompt="namespace > ") || return 1
+    echo "$ns"
+}
+
+# ── Resource type picker ────────────────────────────────────────────
+pick_resource_type() {
+    local ns="$1"
+    local type
+    type=$(printf '%s\n' Pods Deployments StatefulSets DaemonSets Services Ingresses ConfigMaps Secrets PVCs ServiceAccounts Jobs CronJobs Nodes "──────────" "Events" "Other..." \
+        | fzf "${FZF_SINGLE[@]}" --header="Namespace: ${ns}" --prompt="resource type > ") || return 1
+    if [[ "$type" == "──────────" ]]; then
+        return 1
+    elif [[ "$type" == "Other..." ]]; then
+        type=$(kubectl api-resources --verbs=list --namespaced -o name 2>/dev/null \
+            | fzf "${FZF_SINGLE[@]}" --header="All resource types" --prompt="resource type > ") || return 1
+    fi
+    echo "$type"
+}
+
+# Map display name to kubectl resource name
+resource_kubectl_name() {
+    case "$1" in
+        Pods)            echo "pods" ;;
+        Deployments)     echo "deployments" ;;
+        StatefulSets)    echo "statefulsets" ;;
+        DaemonSets)      echo "daemonsets" ;;
+        Services)        echo "services" ;;
+        Ingresses)       echo "ingresses" ;;
+        ConfigMaps)      echo "configmaps" ;;
+        Secrets)         echo "secrets" ;;
+        PVCs)            echo "persistentvolumeclaims" ;;
+        ServiceAccounts) echo "serviceaccounts" ;;
+        Jobs)            echo "jobs" ;;
+        CronJobs)        echo "cronjobs" ;;
+        Nodes)           echo "nodes" ;;
+        *)               echo "$1" ;;
+    esac
+}
+
+# ── Resource picker ─────────────────────────────────────────────────
+pick_resource() {
+    local ns="$1"
+    local type="$2"
+    local ktype
+    ktype=$(resource_kubectl_name "$type")
+
+    local ns_flag=(-n "$ns")
+    [[ "$type" == "Nodes" ]] && ns_flag=()
+
+    local selection
+    selection=$(kubectl get "$ktype" "${ns_flag[@]}" --no-headers 2>/dev/null \
+        | fzf "${FZF_SINGLE[@]}" \
+            --header="${type} in ${ns}" \
+            --prompt="${ktype} > " \
+            --preview="kubectl describe ${ktype} {1} ${ns_flag[*]:-}") || return 1
+    echo "$selection" | awk '{print $1}'
+}
+
+# ── Action pickers ──────────────────────────────────────────────────
+actions_for_type() {
+    case "$1" in
+        Pods)
+            printf '%s\n' "View logs" "Follow logs" "Exec into shell" "Describe" "Delete"
+            ;;
+        Deployments)
+            printf '%s\n' "Describe" "Restart" "Scale" "Delete"
+            ;;
+        StatefulSets)
+            printf '%s\n' "Describe" "Restart" "Scale" "Delete"
+            ;;
+        DaemonSets)
+            printf '%s\n' "Describe" "Restart" "Delete"
+            ;;
+        Services)
+            printf '%s\n' "Port-forward" "Describe" "Delete"
+            ;;
+        Ingresses)
+            printf '%s\n' "Describe" "Delete"
+            ;;
+        ConfigMaps)
+            printf '%s\n' "Describe" "Delete"
+            ;;
+        Secrets)
+            printf '%s\n' "View decoded" "Describe" "Delete"
+            ;;
+        Jobs)
+            printf '%s\n' "View logs" "Describe" "Delete"
+            ;;
+        CronJobs)
+            printf '%s\n' "Describe" "Delete"
+            ;;
+        PVCs)
+            printf '%s\n' "Describe" "Delete"
+            ;;
+        ServiceAccounts)
+            printf '%s\n' "Describe" "Delete"
+            ;;
+        Nodes)
+            printf '%s\n' "Describe"
+            ;;
+        *)
+            printf '%s\n' "Describe" "Delete"
+            ;;
+    esac
+}
+
+pick_action() {
+    local type="$1"
+    local resource="$2"
+    local action
+    action=$(actions_for_type "$type" \
+        | fzf "${FZF_SINGLE[@]}" --header="${type}: ${resource}" --prompt="action > ") || return 1
+    echo "$action"
+}
+
+# ── Action execution ────────────────────────────────────────────────
+exec_action() {
+    local ns="$1"
+    local type="$2"
+    local resource="$3"
+    local action="$4"
+    local ktype
+    ktype=$(resource_kubectl_name "$type")
+
+    case "$action" in
+        "View logs")
+            local log_target="$resource"
+            [[ "$type" == "Jobs" ]] && log_target="job/${resource}"
+            kubectl logs "$log_target" -n "$ns" --tail=200 2>&1 | less -R
+            ;;
+        "Follow logs")
+            printf "${GREEN}Following logs for %s (ctrl-c to stop)${NC}\n" "$resource"
+            kubectl logs -f "$resource" -n "$ns" || printf "${RED}Log stream ended${NC}\n"
+            ;;
+        "Exec into shell")
+            printf "${GREEN}Exec into %s (type 'exit' to return)${NC}\n" "$resource"
+            kubectl exec -it "$resource" -n "$ns" -- /bin/sh || printf "${RED}Exec failed${NC}\n"
+            ;;
+        "View decoded")
+            kubectl get secret "$resource" -n "$ns" \
+                -o go-template='{{range $k, $v := .data}}{{$k}}: {{$v | base64decode}}
+{{end}}' | less -R
+            ;;
+        "Describe")
+            local ns_flag=(-n "$ns")
+            [[ "$type" == "Nodes" ]] && ns_flag=()
+            kubectl describe "$ktype" "$resource" "${ns_flag[@]}" 2>&1 | less -R
+            ;;
+        "Delete")
+            printf "${YELLOW}Delete %s/%s in namespace %s? [y/N] ${NC}" "$ktype" "$resource" "$ns"
+            local confirm
+            read -r confirm </dev/tty
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                kubectl delete "$ktype" "$resource" -n "$ns" \
+                    && printf "${GREEN}Deleted %s/%s${NC}\n" "$ktype" "$resource" \
+                    || printf "${RED}Delete failed${NC}\n"
+            else
+                printf "${GRAY}Cancelled${NC}\n"
+            fi
+            ;;
+        "Restart")
+            kubectl rollout restart "$ktype" "$resource" -n "$ns" \
+                && printf "${GREEN}Restarted %s %s${NC}\n" "$ktype" "$resource" \
+                || printf "${RED}Restart failed${NC}\n"
+            ;;
+        "Scale")
+            printf "${YELLOW}Replicas: ${NC}"
+            local replicas
+            read -r replicas </dev/tty
+            if [[ "$replicas" =~ ^[0-9]+$ ]]; then
+                kubectl scale "$ktype" "$resource" -n "$ns" --replicas="$replicas" \
+                    && printf "${GREEN}Scaled %s %s to %s replicas${NC}\n" "$ktype" "$resource" "$replicas" \
+                    || printf "${RED}Scale failed${NC}\n"
+            else
+                printf "${RED}Invalid replica count${NC}\n"
+            fi
+            ;;
+        "Port-forward")
+            local ports
+            ports=$(kubectl get service "$resource" -n "$ns" \
+                -o jsonpath='{range .spec.ports[*]}{.port}:{.targetPort}{"\n"}{end}')
+            local port
+            port=$(echo "$ports" \
+                | fzf "${FZF_SINGLE[@]}" --header="Select port for ${resource}" --prompt="port > ") || return 1
+            local svc_port="${port%%:*}"
+            local local_port
+            printf "${YELLOW}Local port [%s]: ${NC}" "$svc_port"
+            read -r local_port </dev/tty
+            local_port="${local_port:-$svc_port}"
+            if ! [[ "$local_port" =~ ^[0-9]+$ ]]; then
+                printf "${RED}Invalid port number${NC}\n"
+                return 1
+            fi
+            printf "${GREEN}Port-forwarding svc/%s localhost:%s -> %s (ctrl-c to stop)${NC}\n" "$resource" "$local_port" "$svc_port"
+            kubectl port-forward "svc/${resource}" -n "$ns" "${local_port}:${svc_port}" \
+                || printf "${RED}Port-forward ended${NC}\n"
+            ;;
+    esac
+}
+
+# ── Main loop ───────────────────────────────────────────────────────
+main() {
+    check_deps
+
+    local context cluster
+    context=$(kubectl config current-context 2>/dev/null) || die "No active kubeconfig context"
+    cluster=$(kubectl config view -o jsonpath="{.contexts[?(@.name==\"${context}\")].context.cluster}" 2>/dev/null)
+
+    printf "${GREEN}kube-fuzzy${NC} ${GRAY}— Kubernetes browser${NC}\n"
+    printf "${GRAY}Cluster:${NC} %s ${GRAY}(%s)${NC}\n\n" "$cluster" "$context"
+
+    while true; do
+        local ns
+        ns=$(pick_namespace) || break
+
+        while true; do
+            local type
+            type=$(pick_resource_type "$ns") || break
+
+            if [[ "$type" == "Events" ]]; then
+                kubectl get events -n "$ns" --sort-by=.lastTimestamp 2>&1 | less -R
+                continue
+            fi
+
+            while true; do
+                local resource
+                resource=$(pick_resource "$ns" "$type") || break
+
+                while true; do
+                    local action
+                    action=$(pick_action "$type" "$resource") || break
+
+                    exec_action "$ns" "$type" "$resource" "$action"
+                    printf "\n"
+                done
+            done
+        done
+    done
+}
+
+main

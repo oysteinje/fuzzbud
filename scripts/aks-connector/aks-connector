@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# aks-connector — Fuzzy AKS cluster connection from the terminal
+# =============================================================================
+
+#     __         __            __            _
+#    / /____  __/ /_  ___     / /___  ____ _(_)___
+#   / //_/ / / / __ \/ _ \   / / __ \/ __ `/ / __ \
+#  / ,< / /_/ / /_/ /  __/  / / /_/ / /_/ / / / /
+# /_/|_|\__,_/_.___/\___/  /_/\____/\__, /_/_/ /_/
+#                                  /____/
+
+# -----------------------------------------------------------------------------
+# Constants & Configuration
+# -----------------------------------------------------------------------------
+
+ARM_API="https://management.azure.com"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m' # No Color
+
+# fzf configuration — dynamic height (~) requires fzf 0.30+
+_fzf_ver=$(fzf --version 2>/dev/null | awk '{print $1}')
+if printf '%s\n' "0.30.0" "$_fzf_ver" | sort -V -C 2>/dev/null; then
+    FZF_COMMON=(--height=~50% --border --margin=1,2 --ansi)
+else
+    FZF_COMMON=(--height=50% --border --margin=1,2 --ansi)
+fi
+unset _fzf_ver
+FZF_SINGLE=("${FZF_COMMON[@]}" --no-multi)
+
+# fzf headers
+FZF_HEADER_CLUSTER="--header=Select AKS cluster to connect to (Esc to exit)"
+
+# Bearer token
+TOKEN_ARM=""
+
+# Session caching
+CACHE_SUB_LOOKUP=""
+
+# -----------------------------------------------------------------------------
+# Utility Functions
+# -----------------------------------------------------------------------------
+
+die() {
+    local msg="$1"
+    local code="${2:-1}"
+    printf "${RED}Error: %s${NC}\n" "$msg" >&2
+    exit "$code"
+}
+
+check_deps() {
+    local missing=()
+    local deps=(fzf jq az kubelogin)
+
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &>/dev/null; then
+            missing+=("$dep")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        die "Missing required dependencies: $(IFS=', '; echo "${missing[*]}")"
+    fi
+}
+
+
+show_spinner() {
+    local pid="$1"
+    local message="$2"
+    local frames=('|' '/' '-' '\')
+    local i=0
+
+    while kill -0 "$pid" 2>/dev/null; do
+        printf "\r%s %s" "$message" "${frames[i % ${#frames[@]}]}"
+        i=$(( i + 1 ))
+        sleep 0.1
+    done
+
+    wait "$pid"
+    local status=$?
+    printf "\r\033[K"
+    return "$status"
+}
+
+load_subscription_lookup() {
+    [[ -n "$CACHE_SUB_LOOKUP" ]] && return 0
+
+    local subs_json active_tenant
+    active_tenant=$(jq -r '.subscriptions[]? | select(.isDefault == true) | .tenantId // empty' \
+        ~/.azure/azureProfile.json 2>/dev/null | head -1) || active_tenant=""
+
+    if [[ -n "$active_tenant" ]]; then
+        subs_json=$(jq --arg tid "$active_tenant" \
+            '[.subscriptions[]? | select(.tenantId == $tid)]' \
+            ~/.azure/azureProfile.json 2>/dev/null) || return 1
+    else
+        subs_json=$(jq '.subscriptions // []' ~/.azure/azureProfile.json 2>/dev/null) || return 1
+    fi
+    CACHE_SUB_LOOKUP="$subs_json"
+}
+
+lookup_subscription_name() {
+    local sub_id="$1"
+    [[ -n "$sub_id" ]] || { printf "unknown"; return 0; }
+
+    load_subscription_lookup >/dev/null 2>&1 || true
+
+    local sub_name=""
+    if [[ -n "$CACHE_SUB_LOOKUP" ]]; then
+        sub_name=$(jq -r --arg id "$sub_id" 'map(select(.id == $id) | .name)[0] // empty' \
+            <<< "$CACHE_SUB_LOOKUP" 2>/dev/null)
+    fi
+
+    printf "%s" "${sub_name:-$sub_id}"
+}
+
+print_tenant_info() {
+    local account_json="$1"
+    local tenant_name
+    tenant_name=$(jq -r '.tenantDisplayName // .tenantId // empty' <<< "$account_json" 2>/dev/null) || tenant_name=""
+    [[ -z "$tenant_name" ]] && tenant_name="unknown"
+    printf "${GREEN}Logged in${NC} — Tenant: %s\n" "$tenant_name"
+}
+
+# -----------------------------------------------------------------------------
+# API Functions
+# -----------------------------------------------------------------------------
+
+fetch_clusters() {
+    local query='resources
+        | where type == "microsoft.containerservice/managedclusters"
+        | project name, resourceGroup, subscriptionId, location,
+            kubernetesVersion=tostring(properties.kubernetesVersion),
+            fqdn=tostring(properties.fqdn)
+        | order by name asc'
+
+    local payload
+    payload=$(jq -n --arg q "$query" '{"query":$q,"options":{"resultFormat":"objectArray"}}')
+
+    curl -sf -X POST \
+        -H "Authorization: Bearer $TOKEN_ARM" \
+        -H "Content-Type: application/json" \
+        -d "$payload" \
+        "${ARM_API}/providers/Microsoft.ResourceGraph/resources?api-version=2021-03-01"
+}
+
+# -----------------------------------------------------------------------------
+# Display Formatting
+# -----------------------------------------------------------------------------
+
+format_clusters() {
+    local json="$1"
+    jq -r '.data[]? |
+        [
+            .name,
+            .resourceGroup,
+            .subscriptionId,
+            .location,
+            (.kubernetesVersion // "unknown")
+        ] | @tsv' <<< "$json" 2>/dev/null \
+    | while IFS=$'\t' read -r name rg sub_id location k8s_ver; do
+        local sub_name
+        sub_name=$(lookup_subscription_name "$sub_id")
+        printf '%-32s  \033[2m| %-22s  | %-22s  | %-12s  %s\033[0m\t%s\t%s\t%s\n' \
+            "$name" "$sub_name" "$rg" "$location" "${k8s_ver:-unknown}" \
+            "$sub_id" "$rg" "$name"
+    done
+}
+
+# -----------------------------------------------------------------------------
+# Connection
+# -----------------------------------------------------------------------------
+
+connect_cluster() {
+    local sub_id="$1"
+    local rg="$2"
+    local name="$3"
+
+    printf "\n${GREEN}Connecting to %s${NC}\n" "$name"
+    printf "  Subscription:   %s\n" "$(lookup_subscription_name "$sub_id")"
+    printf "  Resource group: %s\n\n" "$rg"
+
+    az aks get-credentials \
+        --subscription "$sub_id" \
+        --resource-group "$rg" \
+        --name "$name" \
+        --overwrite-existing
+
+    kubelogin convert-kubeconfig -l azurecli
+
+    local ctx
+    ctx=$(kubectl config current-context 2>/dev/null) || ctx="$name"
+    printf "\n${GREEN}Connected!${NC} kubectl context: %s\n" "$ctx"
+}
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+main() {
+    check_deps
+
+    # Fetch ARM token and account info in parallel
+    local tmp_token tmp_account
+    tmp_token=$(mktemp)
+    tmp_account=$(mktemp)
+
+    az account get-access-token --resource "https://management.azure.com" > "$tmp_token" 2>/dev/null &
+    local pid_token=$!
+    az account show > "$tmp_account" 2>/dev/null &
+    local pid_account=$!
+
+    wait "$pid_token" "$pid_account" 2>/dev/null || true
+
+    TOKEN_ARM=$(jq -r '.accessToken // empty' "$tmp_token" 2>/dev/null) || TOKEN_ARM=""
+    local account_json
+    account_json=$(<"$tmp_account")
+    rm -f "$tmp_token" "$tmp_account"
+
+    [[ -n "$TOKEN_ARM" ]] || die "Failed to acquire access token — run \`az login\` first"
+    print_tenant_info "$account_json"
+
+    local current_ctx
+    current_ctx=$(kubectl config current-context 2>/dev/null) || current_ctx=""
+    if [[ -n "$current_ctx" ]]; then
+        printf "Current context: %s\n" "$current_ctx"
+    fi
+
+    local tmp_clusters
+    tmp_clusters=$(mktemp)
+
+    fetch_clusters > "$tmp_clusters" 2>/dev/null &
+    local pid=$!
+    show_spinner "$pid" "Fetching AKS clusters"
+
+    local clusters_json
+    clusters_json=$(<"$tmp_clusters")
+    rm -f "$tmp_clusters"
+
+    local cluster_count
+    cluster_count=$(jq '.data | length' <<< "$clusters_json" 2>/dev/null) || cluster_count=0
+
+    if [[ "$cluster_count" -eq 0 ]]; then
+        printf "${YELLOW}No AKS clusters found in this tenant.${NC}\n"
+        exit 0
+    fi
+
+    load_subscription_lookup 2>/dev/null || true
+
+    local lines
+    lines=$(format_clusters "$clusters_json")
+
+    local selected
+    selected=$(printf '%s\n' "$lines" | \
+        fzf "${FZF_SINGLE[@]}" \
+            "$FZF_HEADER_CLUSTER" \
+            --with-nth=1 \
+            --delimiter=$'\t' \
+            --prompt="Cluster > ") || exit 0
+
+    [[ -n "$selected" ]] || exit 0
+
+    local sub_id rg name
+    sub_id=$(cut -d$'\t' -f2 <<< "$selected")
+    rg=$(cut -d$'\t' -f3 <<< "$selected")
+    name=$(cut -d$'\t' -f4 <<< "$selected")
+
+    connect_cluster "$sub_id" "$rg" "$name"
+}
+
+main "$@"

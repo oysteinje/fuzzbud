@@ -1,0 +1,399 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# fuzzbud — Unified fuzzy tool launcher and installer
+#
+# Usage:
+#   fuzzbud                      Interactive launcher (loops until Esc)
+#   fuzzbud install              Pick tools to install interactively
+#   fuzzbud install <tool>       Install a specific tool by name
+#   fuzzbud install --tag TAG    Install all tools matching a tag
+#   fuzzbud list                 Show all tools with install status and tags
+#   fuzzbud --init               Print shell integration for ctrl+r binding
+#   fuzzbud --help               Show this help
+# =============================================================================
+
+# GitHub source — override with env vars for forks or testing
+FUZZBUD_REPO="${FUZZBUD_REPO:-oysteinje/fuzzbud}"
+FUZZBUD_REF="${FUZZBUD_REF:-main}"
+RAW_BASE="https://raw.githubusercontent.com/${FUZZBUD_REPO}/${FUZZBUD_REF}"
+
+INSTALL_DIR="${FUZZBUD_INSTALL_DIR:-${HOME}/.local/bin}"
+
+# -----------------------------------------------------------------------------
+# Colors
+# -----------------------------------------------------------------------------
+
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[0;33m'
+GRAY=$'\033[90m'
+CYAN_BOLD=$'\033[1;36m'
+BOLD=$'\033[1m'
+NC=$'\033[0m'
+
+# Tag badge colors
+_TAG_AZURE=$'\033[0;36m'
+_TAG_KUBERNETES=$'\033[0;32m'
+_TAG_GITHUB=$'\033[0;37m'
+_TAG_DOCKER=$'\033[0;34m'
+_TAG_GCP=$'\033[0;33m'
+
+# -----------------------------------------------------------------------------
+# fzf setup
+# -----------------------------------------------------------------------------
+
+_fzf_ver=$(fzf --version 2>/dev/null | awk '{print $1}')
+if printf '%s\n' "0.30.0" "$_fzf_ver" | sort -V -C 2>/dev/null; then
+    FZF_COMMON=(--height=~60% --border --margin=1,2 --ansi)
+else
+    FZF_COMMON=(--height=60% --border --margin=1,2 --ansi)
+fi
+unset _fzf_ver
+FZF_SINGLE=("${FZF_COMMON[@]}" --no-multi)
+FZF_MULTI=("${FZF_COMMON[@]}" --multi --bind=tab:toggle,ctrl-a:toggle-all)
+
+# -----------------------------------------------------------------------------
+# Registry
+#
+# Embedded fallback — used when fuzzbud is installed as a standalone binary.
+# Format per entry: name|description|space-separated-deps|comma-separated-tags
+# -----------------------------------------------------------------------------
+
+REGISTRY=(
+    "aks-connector|Browse and connect to AKS clusters across your Azure tenant|fzf az jq kubelogin kubectl|azure,kubernetes"
+    "kube-fuzzy|Navigate Kubernetes resources and run actions interactively|fzf kubectl|kubernetes"
+    "gha-fuzzy|Browse and trigger GitHub Actions workflows and runs|fzf gh|github"
+    "pim-me-up|Activate Azure PIM roles from the terminal|fzf az jq curl|azure"
+)
+
+# If a registry file lives next to this script (repo clone), prefer that
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${SCRIPT_DIR}/registry" ]]; then
+    mapfile -t REGISTRY < <(grep -v '^#' "${SCRIPT_DIR}/registry" | grep -v '^[[:space:]]*$')
+fi
+
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
+
+die() {
+    printf "${RED}Error: %s${NC}\n" "$1" >&2
+    exit "${2:-1}"
+}
+
+is_installed() {
+    command -v "$1" &>/dev/null
+}
+
+strip_ansi() {
+    sed 's/\x1b\[[0-9;]*m//g' <<< "$1"
+}
+
+tag_color() {
+    case "$1" in
+        azure)      printf '%s' "$_TAG_AZURE" ;;
+        kubernetes) printf '%s' "$_TAG_KUBERNETES" ;;
+        github)     printf '%s' "$_TAG_GITHUB" ;;
+        docker)     printf '%s' "$_TAG_DOCKER" ;;
+        gcp)        printf '%s' "$_TAG_GCP" ;;
+        *)          printf '%s' "$GRAY" ;;
+    esac
+}
+
+format_tag_badges() {
+    local tags_str="$1"
+    local out=""
+    IFS=',' read -ra tags <<< "$tags_str"
+    for tag in "${tags[@]}"; do
+        local color
+        color=$(tag_color "$tag")
+        out+="${color}[${tag}]${NC} "
+    done
+    printf '%s' "$out"
+}
+
+registry_lookup() {
+    local name="$1"
+    for entry in "${REGISTRY[@]}"; do
+        [[ "${entry%%|*}" == "$name" ]] && printf '%s' "$entry" && return 0
+    done
+    return 1
+}
+
+# -----------------------------------------------------------------------------
+# Install
+# -----------------------------------------------------------------------------
+
+install_tool() {
+    local name="$1"
+    local entry
+
+    if ! entry=$(registry_lookup "$name"); then
+        printf "${RED}Unknown tool: %s${NC}\n" "$name" >&2
+        return 1
+    fi
+
+    local desc deps tags
+    IFS='|' read -r _ desc deps tags <<< "$entry"
+
+    # Warn about missing deps (don't block — user may install later)
+    local missing=()
+    for dep in $deps; do
+        is_installed "$dep" || missing+=("$dep")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        printf "${YELLOW}  Note: %s needs %s (not found in PATH)${NC}\n" "$name" "${missing[*]}"
+    fi
+
+    local url="${RAW_BASE}/scripts/${name}/${name}"
+    printf "  Installing %-20s " "${name}..."
+    local tmp
+    tmp=$(mktemp)
+    # shellcheck disable=SC2064
+    trap "rm -f '$tmp'" RETURN
+
+    if curl -fsSL "$url" -o "$tmp" 2>/dev/null; then
+        chmod +x "$tmp"
+        mkdir -p "$INSTALL_DIR"
+        mv "$tmp" "${INSTALL_DIR}/${name}"
+        printf "${GREEN}done${NC} → %s/%s\n" "$INSTALL_DIR" "$name"
+    else
+        rm -f "$tmp"
+        printf "${RED}failed${NC}\n"
+        printf "  Could not download: %s\n" "$url" >&2
+        return 1
+    fi
+}
+
+cmd_install() {
+    local subarg="${1:-}"
+
+    # fuzzbud install --tag <tag>
+    if [[ "$subarg" == "--tag" ]]; then
+        local tag="${2:-}"
+        [[ -n "$tag" ]] || die "Usage: fuzzbud install --tag TAG"
+        local found=0
+        for entry in "${REGISTRY[@]}"; do
+            local name tags
+            name="${entry%%|*}"
+            tags="${entry##*|}"
+            if [[ ",${tags}," == *",${tag},"* ]]; then
+                install_tool "$name"
+                found=1
+            fi
+        done
+        [[ "$found" -eq 1 ]] || printf "${YELLOW}No tools found with tag: %s${NC}\n" "$tag"
+        return
+    fi
+
+    # fuzzbud install <name>
+    if [[ -n "$subarg" && "$subarg" != --* ]]; then
+        install_tool "$subarg"
+        return
+    fi
+
+    # fuzzbud install — interactive multi-select
+    command -v fzf &>/dev/null || die "fzf is required for interactive install (or use: fuzzbud install <tool>)"
+
+    local lines=()
+    for entry in "${REGISTRY[@]}"; do
+        local name desc deps tags
+        IFS='|' read -r name desc deps tags <<< "$entry"
+
+        local badges
+        badges=$(format_tag_badges "$tags")
+
+        local status_icon
+        if is_installed "$name"; then
+            status_icon="${GREEN}✓ installed${NC}"
+        else
+            status_icon="${GRAY}  not installed${NC}"
+        fi
+
+        # Tab-delimited: name \t display-line
+        lines+=("${name}"$'\t'"${badges}${CYAN_BOLD}$(printf '%-20s' "$name")${NC}  ${GRAY}${desc}${NC}  ${status_icon}")
+    done
+
+    [[ ${#lines[@]} -gt 0 ]] || { printf "${YELLOW}Registry is empty.${NC}\n"; return; }
+
+    local selected
+    selected=$(printf '%s\n' "${lines[@]}" \
+        | fzf "${FZF_MULTI[@]}" \
+            --with-nth=2.. \
+            --delimiter=$'\t' \
+            --header=$'Tab=select  Ctrl-A=all  Enter=install  Esc=cancel\nFilter by typing a tag name (e.g. azure, kubernetes, github)' \
+            --prompt="install > ") || return 0
+
+    [[ -n "$selected" ]] || return 0
+
+    local tools=()
+    while IFS=$'\t' read -r name _; do
+        tools+=("$name")
+    done <<< "$selected"
+
+    printf "\n${BOLD}Installing %d tool(s)...${NC}\n\n" "${#tools[@]}"
+    local ok=0 fail=0
+    for tool in "${tools[@]}"; do
+        if install_tool "$tool"; then
+            (( ok++ )) || true
+        else
+            (( fail++ )) || true
+        fi
+    done
+
+    printf "\n"
+    [[ "$ok"   -gt 0 ]] && printf "${GREEN}%d installed${NC}\n" "$ok"
+    [[ "$fail" -gt 0 ]] && printf "${RED}%d failed${NC}\n"    "$fail"
+
+    if ! printf '%s' ":${PATH}:" | grep -q ":${INSTALL_DIR}:"; then
+        printf "\n${YELLOW}Note: add %s to your PATH${NC}\n" "$INSTALL_DIR"
+        printf "  echo 'export PATH=\"%s:\$PATH\"' >> ~/.bashrc\n" "$INSTALL_DIR"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# List
+# -----------------------------------------------------------------------------
+
+cmd_list() {
+    local installed=0 missing=0
+    printf "\n  ${BOLD}fuzzbud tools${NC}\n\n"
+    for entry in "${REGISTRY[@]}"; do
+        local name desc deps tags
+        IFS='|' read -r name desc deps tags <<< "$entry"
+        local badges
+        badges=$(format_tag_badges "$tags")
+        if is_installed "$name"; then
+            printf "  ${GREEN}✓${NC}  %-20s  %s  ${GRAY}%s${NC}\n" "$name" "$badges" "$desc"
+            (( installed++ )) || true
+        else
+            printf "  ${GRAY}✗  %-20s  %s  %s${NC}\n" "$name" "$badges" "$desc"
+            (( missing++ )) || true
+        fi
+    done
+    printf "\n  ${GRAY}%d installed, %d not installed${NC}\n\n" "$installed" "$missing"
+}
+
+# -----------------------------------------------------------------------------
+# Launch
+# -----------------------------------------------------------------------------
+
+build_launch_list() {
+    for entry in "${REGISTRY[@]}"; do
+        local name desc
+        name="${entry%%|*}"
+        desc="${entry#*|}"; desc="${desc%%|*}"
+        if is_installed "$name"; then
+            printf "${CYAN_BOLD}%-20s${NC}  ${GRAY}%s${NC}\n" "$name" "$desc"
+        fi
+    done
+}
+
+pick_tool() {
+    local list
+    list=$(build_launch_list)
+    [[ -n "$list" ]] || die "No tools installed. Run: fuzzbud install"
+
+    local selection
+    selection=$(printf "%s" "$list" \
+        | fzf "${FZF_SINGLE[@]}" \
+            --bind 'ctrl-r:ignore' \
+            --header="Select a tool  (Esc to exit)" \
+            --prompt="fuzzbud > ") || return 1
+
+    strip_ansi "$selection" | awk '{print $1}'
+}
+
+cmd_launch() {
+    command -v fzf &>/dev/null || die "fzf is required"
+
+    while true; do
+        local tool
+        tool=$(pick_tool) || break
+
+        printf "\n"
+        FZF_DEFAULT_OPTS="${FZF_DEFAULT_OPTS:+$FZF_DEFAULT_OPTS }--bind 'ctrl-r:execute(fuzzbud </dev/tty)+abort'" "$tool" || true
+        printf "\n${GRAY}─────────────────────────────────────────────────────────────${NC}\n\n"
+    done
+}
+
+# -----------------------------------------------------------------------------
+# Shell integration
+# -----------------------------------------------------------------------------
+
+cmd_init() {
+    cat <<'EOF'
+# fuzzbud — shell integration
+# Binds ctrl+r to the fuzzbud tool launcher.
+# Generated by: fuzzbud --init
+_fuzzbud_launch() {
+    local script
+    script=$(command -v fuzzbud 2>/dev/null) || return
+    if [[ -n "${ZSH_VERSION:-}" ]]; then
+        "$script" </dev/tty
+        zle reset-prompt 2>/dev/null || true
+    else
+        "$script" </dev/tty
+    fi
+}
+
+if command -v fuzzbud &>/dev/null; then
+    if [[ -n "${ZSH_VERSION:-}" ]]; then
+        zle -N _fuzzbud_launch
+        bindkey '^R' _fuzzbud_launch
+    else
+        bind -x '"\C-r": _fuzzbud_launch'
+    fi
+fi
+EOF
+}
+
+# -----------------------------------------------------------------------------
+# Entry point
+# -----------------------------------------------------------------------------
+
+main() {
+    case "${1:-}" in
+        install)
+            shift
+            cmd_install "${@}"
+            ;;
+        list)
+            cmd_list
+            ;;
+        --init)
+            cmd_init
+            ;;
+        --help|-h)
+            cat <<'EOF'
+Usage: fuzzbud [command] [options]
+
+Commands:
+  (none)               Interactive tool launcher
+  install              Pick tools to install interactively
+  install <tool>       Install a specific tool by name
+  install --tag TAG    Install all tools matching a tag (azure, kubernetes, github, ...)
+  list                 Show all known tools and install status
+
+Options:
+  --init               Print shell integration (ctrl+r binding)
+  --help               Show this help
+
+Environment:
+  FUZZBUD_REPO         GitHub repo to download from  (default: oysteinje/fuzzbud)
+  FUZZBUD_REF          Git ref (branch/tag/commit)   (default: main)
+  FUZZBUD_INSTALL_DIR  Install directory              (default: ~/.local/bin)
+EOF
+            ;;
+        "")
+            cmd_launch
+            ;;
+        *)
+            die "Unknown command: $1. Run 'fuzzbud --help' for usage."
+            ;;
+    esac
+}
+
+main "$@"

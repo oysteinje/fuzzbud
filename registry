@@ -1,0 +1,7 @@
+# fuzzbud registry
+# Format: name|description|space-separated-deps|comma-separated-tags
+# Tags: azure, kubernetes, github, docker, gcp
+aks-connector|Browse and connect to AKS clusters across your Azure tenant|fzf az jq kubelogin kubectl|azure,kubernetes
+kube-fuzzy|Navigate Kubernetes resources and run actions interactively|fzf kubectl|kubernetes
+gha-fuzzy|Browse and trigger GitHub Actions workflows and runs|fzf gh|github
+pim-me-up|Activate Azure PIM roles from the terminal|fzf az jq curl|azure

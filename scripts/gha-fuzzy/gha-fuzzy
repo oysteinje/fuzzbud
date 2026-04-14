@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# gha-fuzzy — Fast GitHub Actions workflow browser from the terminal
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Constants & Configuration
+# -----------------------------------------------------------------------------
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+GRAY='\033[90m'
+CYAN_BOLD='\033[1;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+# fzf configuration 
+FZF_COMMON=(--ansi)
+FZF_SINGLE=("${FZF_COMMON[@]}" --no-multi)
+
+# fzf headers
+FZF_HEADER_WORKFLOW="--header=Select workflow (Esc to exit)"
+FZF_HEADER_RUN="--header=Select run (Esc=back)"
+FZF_HEADER_ACTION="--header=Select action (Esc=back)"
+FZF_HEADER_JOB="--header=Select job (Esc=back)"
+
+# Global State
+REPO_FLAG=""
+
+# -----------------------------------------------------------------------------
+# Utility Functions
+# -----------------------------------------------------------------------------
+
+die() {
+    local msg="$1"
+    local code="${2:-1}"
+    printf "${RED}Error: %s${NC}\n" "$msg" >&2
+    exit "$code"
+}
+
+check_deps() {
+    local missing=()
+    local deps=(fzf gh awk cut)
+
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &>/dev/null; then
+            missing+=("$dep")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        die "Missing required dependencies: $(IFS=', '; echo "${missing[*]}")"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# API & Data Formatting
+# -----------------------------------------------------------------------------
+
+# Format raw gh log output: strip job/step prefix, inject step headers from API.
+# Args: mode run_id [job_id]
+#   mode=job  -> single job, fetch steps for job_id
+#   mode=all  -> all jobs, show job + step headers
+format_logs() {
+    local mode="$1" run_id="$2" job_id="${3:-}"
+
+    # Fetch step names from the API, keyed by startedAt timestamp
+    local steps_data
+    if [[ "$mode" == "job" && -n "$job_id" ]]; then
+        steps_data=$(gh run view "$run_id" $REPO_FLAG --json jobs \
+            -q ".jobs[] | select(.databaseId==$job_id) | .steps[] | \"\(.startedAt)\t\(.name)\"" 2>/dev/null)
+    else
+        steps_data=$(gh run view "$run_id" $REPO_FLAG --json jobs \
+            -q '.jobs[] as $j | $j.steps[] | "\($j.name)\t\(.startedAt)\t\(.name)"' 2>/dev/null)
+    fi
+
+    awk -F'\t' -v mode="$mode" -v steps="$steps_data" \
+        -v cyan_bold="${CYAN_BOLD}" -v bold="${BOLD}" -v nc="${NC}" '
+        BEGIN {
+            prev_job=""
+            # Build lookup: timestamp -> step name
+            split(steps, lines, "\n")
+            for (i in lines) {
+                if (lines[i]=="") continue
+                if (mode=="job") {
+                    split(lines[i], parts, "\t")
+                    # Key by seconds-precision timestamp
+                    key = substr(parts[1], 1, 19)
+                    names[key] = parts[2]
+                } else {
+                    split(lines[i], parts, "\t")
+                    key = parts[1] "\t" substr(parts[2], 1, 19)
+                    names[key] = parts[3]
+                }
+            }
+            showed_setup=0
+        }
+        {
+            job=$1; line=$3
+
+            if (mode=="all" && job!=prev_job) {
+                if (NR>1) print ""
+                printf "%s══ %s ══%s\n", cyan_bold, job, nc
+                prev_job=job
+                showed_setup=0
+            }
+
+            # "Set up job" has no ##[group]Run marker, show it on first line
+            if (!showed_setup) {
+                printf "\n%s── Set up job ──%s\n", bold, nc
+                showed_setup=1
+            }
+
+            # Detect step boundaries via ##[group]Run markers
+            if (line ~ /##\[group\]Run /) {
+                # Look up friendly name from API by matching timestamp
+                ts = line
+                gsub(/^[^0-9]+/, "", ts)
+                ts = substr(ts, 1, 19)
+                if (mode=="job") name = names[ts]
+                else             name = names[job "\t" ts]
+                # Fall back to the action name from the marker
+                if (name == "") {
+                    name = line
+                    sub(/.*##\[group\]Run /, "", name)
+                    sub(/[[:space:]]*$/, "", name)
+                }
+                printf "\n%s── %s ──%s\n", bold, name, nc
+            }
+
+            print line
+        }'
+}
+
+# -----------------------------------------------------------------------------
+# UI Flow Functions
+# -----------------------------------------------------------------------------
+
+pick_workflow() {
+    local workflow
+    workflow=$(gh workflow list $REPO_FLAG --all --limit 1000 --json name,id,state \
+        -q '.[] | "\(.id)\t\(.state)\t\(.name)"' \
+        | fzf "${FZF_SINGLE[@]}" "$FZF_HEADER_WORKFLOW" --with-nth=2.. \
+            --preview "gh run list $REPO_FLAG --workflow={1} --limit=5 \
+                --json status,conclusion,headBranch,createdAt,displayTitle \
+                -q '.[] | \"\(.createdAt | split(\"T\")[0])  \(.conclusion // .status)  \(.headBranch)  \(.displayTitle)\"'" \
+            --preview-window=down:5:wrap \
+        | cut -f1) || return 1
+    echo "$workflow"
+}
+
+pick_run() {
+    local workflow="$1"
+    local run_data=""
+    
+    # GHEC data residency may block responses containing runs with unrewritten URLs.
+    # Try progressively smaller limits to get as many runs as possible.
+    for limit in 20 10 5; do
+        if run_data=$(gh run list $REPO_FLAG --workflow="$workflow" --limit="$limit" \
+            --json databaseId,status,conclusion,headBranch,createdAt,displayTitle \
+            -q '.[] | "\(.databaseId)\t\(.createdAt)\t\(.status)\t\(.conclusion // "-")\t\(.headBranch)\t\(.displayTitle)"' 2>/dev/null); then
+            break
+        fi
+        run_data=""
+    done
+
+    if [[ -z "$run_data" ]]; then
+        return 1
+    fi
+
+    local run
+    run=$(printf '%s' "$run_data" \
+        | awk -F'\t' -v green="${GREEN}" -v red="${RED}" -v yellow="${YELLOW}" -v gray="${GRAY}" -v nc="${NC}" 'BEGIN{OFS="\t"}
+            {
+                c=$4; s=$3
+                if(c=="success")          color=green
+                else if(c=="failure")     color=red
+                else if(s~/in_progress|queued|waiting/) color=yellow
+                else if(c~/cancelled|skipped/)          color=gray
+                else                      color=""
+                
+                $3=color s nc; $4=color c nc
+                print
+            }' \
+        | fzf "${FZF_SINGLE[@]}" "$FZF_HEADER_RUN" --with-nth=2.. \
+        | cut -f1) || return 1
+        
+    echo "$run"
+}
+
+pick_action() {
+    local action
+    action=$(printf "summary\nlogs\nlogs (all)\nbrowser" \
+        | fzf "${FZF_SINGLE[@]}" "$FZF_HEADER_ACTION") || return 1
+    echo "$action"
+}
+
+pick_job() {
+    local run="$1"
+    local job
+    job=$(gh run view "$run" $REPO_FLAG --json jobs \
+        -q '.jobs[] | "\(.databaseId)\t\(.name)\t\(.conclusion // .status)"' \
+        | awk -F'\t' -v green="${GREEN}" -v red="${RED}" -v yellow="${YELLOW}" -v gray="${GRAY}" -v nc="${NC}" 'BEGIN{OFS="\t"}
+            {
+                c=$3
+                if(c=="success")          color=green
+                else if(c=="failure")     color=red
+                else if(c~/in_progress|queued|waiting/) color=yellow
+                else if(c~/cancelled|skipped/)          color=gray
+                else                      color=""
+                $3=color c nc
+                print
+            }' \
+        | fzf "${FZF_SINGLE[@]}" "$FZF_HEADER_JOB" --with-nth=2.. \
+        | cut -f1) || return 1
+    echo "$job"
+}
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+main() {
+    check_deps
+
+    local repo="${1:-}"
+    if [[ -n "$repo" ]]; then
+        REPO_FLAG="--repo $repo"
+    fi
+
+    # Outer loop: workflow selection
+    while true; do
+        local workflow
+        workflow=$(pick_workflow) || exit 0
+
+        # Middle loop: run selection
+        while true; do
+            local run
+            run=$(pick_run "$workflow") || break  # Esc goes back to workflow selection
+
+            # Inner loop: action selection
+            while true; do
+                local action
+                action=$(pick_action) || break  # Esc goes back to run selection
+
+                case "$action" in
+                    summary)
+                        gh run view "$run" $REPO_FLAG | less -R
+                        ;;
+                    "logs (all)")
+                        if gh run view "$run" $REPO_FLAG --log 2>/dev/null | format_logs all "$run" | less -R; then
+                            :
+                        else
+                            printf "${YELLOW}Logs unavailable (expired or no permission). Showing summary instead:${NC}\n"
+                            gh run view "$run" $REPO_FLAG
+                        fi
+                        ;;
+                    logs)
+                        local job
+                        job=$(pick_job "$run") || continue # Esc goes back to action selection
+                        if [[ -n "$job" ]]; then
+                            if gh run view "$run" $REPO_FLAG --log --job="$job" 2>/dev/null | format_logs job "$run" "$job" | less -R; then
+                                :
+                            else
+                                printf "${YELLOW}Logs unavailable (expired or no permission). Showing summary instead:${NC}\n"
+                                gh run view "$run" $REPO_FLAG
+                            fi
+                        fi
+                        ;;
+                    browser) 
+                        gh run view "$run" $REPO_FLAG --web 
+                        ;;
+                esac
+            done
+        done
+    done
+}
+
+main "$@"
