@@ -147,24 +147,29 @@ install_tool() {
         printf "${YELLOW}  Note: %s needs %s (not found in PATH)${NC}\n" "$name" "${missing[*]}"
     fi
 
-    local url="${RAW_BASE}/scripts/${name}/${name}"
+    local local_source="${SCRIPT_DIR}/scripts/${name}/${name}"
     printf "  Installing %-20s " "${name}..."
     local tmp
     tmp=$(mktemp)
     # shellcheck disable=SC2064
     trap "rm -f '$tmp'" RETURN
 
-    if curl -fsSL "$url" -o "$tmp" 2>/dev/null; then
-        chmod +x "$tmp"
-        mkdir -p "$INSTALL_DIR"
-        mv "$tmp" "${INSTALL_DIR}/${name}"
-        printf "${GREEN}done${NC} → %s/%s\n" "$INSTALL_DIR" "$name"
+    if [[ -f "$local_source" ]]; then
+        cp "$local_source" "$tmp"
     else
-        rm -f "$tmp"
-        printf "${RED}failed${NC}\n"
-        printf "  Could not download: %s\n" "$url" >&2
-        return 1
+        local url="${RAW_BASE}/scripts/${name}/${name}"
+        if ! curl -fsSL "$url" -o "$tmp" 2>/dev/null; then
+            rm -f "$tmp"
+            printf "${RED}failed${NC}\n"
+            printf "  Could not download: %s\n" "$url" >&2
+            return 1
+        fi
     fi
+
+    chmod +x "$tmp"
+    mkdir -p "$INSTALL_DIR"
+    mv "$tmp" "${INSTALL_DIR}/${name}"
+    printf "${GREEN}done${NC} → %s/%s\n" "$INSTALL_DIR" "$name"
 }
 
 cmd_install() {
