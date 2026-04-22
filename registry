@@ -4,4 +4,6 @@
 aks-connector|Browse and connect to AKS clusters across your Azure tenant|fzf az jq kubelogin kubectl|azure,kubernetes
 kube-fuzzy|Navigate Kubernetes resources and run actions interactively|fzf kubectl|kubernetes
 gha-fuzzy|Browse and trigger GitHub Actions workflows and runs|fzf gh|github
+gh-pr-fuzzy|Browse pull requests and take common actions interactively|fzf gh|github
 pim-me-up|Activate Azure PIM roles from the terminal|fzf az jq curl|azure
+docker-fuzzy|Browse Docker containers, images, volumes, and networks interactively|fzf docker|docker

@@ -73,6 +73,7 @@ Add to `~/.bashrc` or `~/.zshrc` to make it permanent.
 | [aks-connector](scripts/aks-connector/) | `azure` `kubernetes` | Browse and connect to AKS clusters across your Azure tenant | fzf az jq kubelogin kubectl |
 | [kube-fuzzy](scripts/kube-fuzzy/) | `kubernetes` | Navigate Kubernetes resources and run actions interactively | fzf kubectl |
 | [gha-fuzzy](scripts/gha-fuzzy/) | `github` | Browse and trigger GitHub Actions workflows and runs | fzf gh |
+| [gh-pr-fuzzy](scripts/gh-pr-fuzzy/) | `github` | Browse pull requests and take common actions interactively | fzf gh |
 | [pim-me-up](scripts/pim-me-up/) | `azure` | Activate Azure PIM roles from the terminal | fzf az jq curl |
 
 ## Install individual tools directly
@@ -88,6 +89,9 @@ curl -fsSL https://raw.githubusercontent.com/oysteinje/fuzzbud/main/scripts/kube
 
 # gha-fuzzy
 curl -fsSL https://raw.githubusercontent.com/oysteinje/fuzzbud/main/scripts/gha-fuzzy/install.sh | bash
+
+# gh-pr-fuzzy
+curl -fsSL https://raw.githubusercontent.com/oysteinje/fuzzbud/main/scripts/gh-pr-fuzzy/install.sh | bash
 
 # pim-me-up
 curl -fsSL https://raw.githubusercontent.com/oysteinje/fuzzbud/main/scripts/pim-me-up/install.sh | bash

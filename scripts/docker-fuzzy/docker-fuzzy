@@ -1,0 +1,417 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ── Colors ──────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+GRAY='\033[90m'
+NC='\033[0m'
+
+# ── Helpers ─────────────────────────────────────────────────────────
+die() {
+    local msg="$1"
+    local code="${2:-1}"
+    printf "${RED}Error: %s${NC}\n" "$msg" >&2
+    exit "$code"
+}
+
+check_deps() {
+    local missing=()
+    local deps=(fzf docker)
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &>/dev/null; then
+            missing+=("$dep")
+        fi
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        die "Missing required dependencies: $(IFS=', '; echo "${missing[*]}")"
+    fi
+    docker info &>/dev/null || die "Cannot connect to Docker daemon — is Docker running?"
+}
+
+format_json() {
+    if command -v jq &>/dev/null; then
+        jq .
+    elif command -v python3 &>/dev/null; then
+        python3 -m json.tool
+    else
+        cat
+    fi
+}
+
+show_spinner() {
+    local pid="$1"
+    local message="$2"
+    local frames=('|' '/' '-' '\')
+    local i=0
+    while kill -0 "$pid" 2>/dev/null; do
+        printf "\r%s %s" "$message" "${frames[i % ${#frames[@]}]}"
+        i=$(( i + 1 ))
+        sleep 0.1
+    done
+    wait "$pid"
+    local status=$?
+    printf "\r\033[K"
+    return "$status"
+}
+
+# ── fzf setup ───────────────────────────────────────────────────────
+_fzf_ver=$(fzf --version 2>/dev/null | awk '{print $1}')
+if printf '%s\n' "0.30.0" "$_fzf_ver" | sort -V -C 2>/dev/null; then
+    FZF_COMMON=(--height=~50% --border --margin=1,2 --ansi)
+else
+    FZF_COMMON=(--height=50% --border --margin=1,2 --ansi)
+fi
+unset _fzf_ver
+FZF_SINGLE=("${FZF_COMMON[@]}" --no-multi)
+
+# ── Resource type picker ────────────────────────────────────────────
+pick_resource_type() {
+    local type
+    type=$(printf '%s\n' "Containers" "Images" "Volumes" "Networks" "──────────" "Prune..." \
+        | fzf "${FZF_SINGLE[@]}" --header="docker-fuzzy" --prompt="resource > ") || return 1
+    [[ "$type" == "──────────" ]] && return 1
+    echo "$type"
+}
+
+# ── Container picker ────────────────────────────────────────────────
+pick_container() {
+    local raw colored selection
+    raw=$(docker ps -a --format "{{.Names}}\t{{.Image}}\t{{.Status}}" 2>/dev/null) || return 1
+
+    if [[ -z "$raw" ]]; then
+        printf "${YELLOW}No containers found${NC}\n"
+        return 1
+    fi
+
+    colored=$(printf '%s\n' "$raw" | awk -F'\t' 'BEGIN{OFS="\t"} {
+        if ($3 ~ /^Up/) col="\033[0;32m"
+        else if ($3 ~ /^Exited/) col="\033[0;31m"
+        else col="\033[90m"
+        $3 = col $3 "\033[0m"
+        print
+    }')
+
+    selection=$(printf '%s\n' "$colored" \
+        | fzf "${FZF_SINGLE[@]}" \
+            --delimiter=$'\t' \
+            --header="Containers" \
+            --prompt="container > " \
+            --preview="docker logs --tail 30 {1} 2>&1") || return 1
+
+    printf '%s\n' "$selection" | cut -f1
+}
+
+# ── Image picker ────────────────────────────────────────────────────
+pick_image() {
+    local raw selection name id
+    raw=$(docker images --format "{{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}\t{{.CreatedSince}}" 2>/dev/null) || return 1
+
+    if [[ -z "$raw" ]]; then
+        printf "${YELLOW}No images found${NC}\n"
+        return 1
+    fi
+
+    selection=$(printf '%s\n' "$raw" \
+        | fzf "${FZF_SINGLE[@]}" \
+            --delimiter=$'\t' \
+            --header="Images" \
+            --prompt="image > " \
+            --preview="docker image history {1} 2>/dev/null || docker image history {2} 2>/dev/null") || return 1
+
+    name=$(printf '%s\n' "$selection" | cut -f1)
+    id=$(printf '%s\n' "$selection" | cut -f2)
+    # Fall back to image ID for untagged images
+    [[ "$name" == "<none>:<none>" ]] && printf '%s\n' "$id" || printf '%s\n' "$name"
+}
+
+# ── Volume picker ────────────────────────────────────────────────────
+pick_volume() {
+    local raw selection
+    raw=$(docker volume ls --format "{{.Name}}\t{{.Driver}}" 2>/dev/null) || return 1
+
+    if [[ -z "$raw" ]]; then
+        printf "${YELLOW}No volumes found${NC}\n"
+        return 1
+    fi
+
+    selection=$(printf '%s\n' "$raw" \
+        | fzf "${FZF_SINGLE[@]}" \
+            --delimiter=$'\t' \
+            --header="Volumes" \
+            --prompt="volume > " \
+            --preview="docker volume inspect {1} 2>/dev/null") || return 1
+
+    printf '%s\n' "$selection" | cut -f1
+}
+
+# ── Network picker ────────────────────────────────────────────────────
+pick_network() {
+    local raw selection
+    raw=$(docker network ls --format "{{.Name}}\t{{.Driver}}\t{{.Scope}}" 2>/dev/null) || return 1
+
+    if [[ -z "$raw" ]]; then
+        printf "${YELLOW}No networks found${NC}\n"
+        return 1
+    fi
+
+    selection=$(printf '%s\n' "$raw" \
+        | fzf "${FZF_SINGLE[@]}" \
+            --delimiter=$'\t' \
+            --header="Networks" \
+            --prompt="network > " \
+            --preview="docker network inspect {1} 2>/dev/null") || return 1
+
+    printf '%s\n' "$selection" | cut -f1
+}
+
+# ── Action pickers ──────────────────────────────────────────────────
+actions_for_type() {
+    case "$1" in
+        Containers)
+            printf '%s\n' "View logs" "Follow logs" "Exec into shell" "Inspect" "Start" "Stop" "Restart" "Remove"
+            ;;
+        Images)
+            printf '%s\n' "Inspect" "History" "Tag" "Remove"
+            ;;
+        Volumes)
+            printf '%s\n' "Inspect" "Remove"
+            ;;
+        Networks)
+            printf '%s\n' "Inspect" "Remove"
+            ;;
+    esac
+}
+
+pick_action() {
+    local type="$1"
+    local resource="$2"
+    local action
+    action=$(actions_for_type "$type" \
+        | fzf "${FZF_SINGLE[@]}" --header="${type}: ${resource}" --prompt="action > ") || return 1
+    echo "$action"
+}
+
+# ── Action execution ────────────────────────────────────────────────
+exec_container_action() {
+    local container="$1"
+    local action="$2"
+
+    case "$action" in
+        "View logs")
+            docker logs --tail=200 "$container" 2>&1 | less -R
+            ;;
+        "Follow logs")
+            printf "${GREEN}Following logs for %s (ctrl-c to stop)${NC}\n" "$container"
+            docker logs -f "$container" 2>&1 || printf "${RED}Log stream ended${NC}\n"
+            ;;
+        "Exec into shell")
+            printf "${GREEN}Exec into %s (type 'exit' to return)${NC}\n" "$container"
+            docker exec -it "$container" bash 2>/dev/null \
+                || docker exec -it "$container" sh \
+                || printf "${RED}Exec failed — container may not be running${NC}\n"
+            ;;
+        "Inspect")
+            docker inspect "$container" 2>/dev/null | format_json | less -R
+            ;;
+        "Start")
+            docker start "$container" \
+                && printf "${GREEN}Started %s${NC}\n" "$container" \
+                || printf "${RED}Start failed${NC}\n"
+            ;;
+        "Stop")
+            docker stop "$container" \
+                && printf "${GREEN}Stopped %s${NC}\n" "$container" \
+                || printf "${RED}Stop failed${NC}\n"
+            ;;
+        "Restart")
+            docker restart "$container" \
+                && printf "${GREEN}Restarted %s${NC}\n" "$container" \
+                || printf "${RED}Restart failed${NC}\n"
+            ;;
+        "Remove")
+            printf "${YELLOW}Remove container %s? [y/N] ${NC}" "$container"
+            local confirm
+            read -r confirm </dev/tty
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                docker rm -f "$container" \
+                    && printf "${GREEN}Removed %s${NC}\n" "$container" \
+                    || printf "${RED}Remove failed${NC}\n"
+            else
+                printf "${GRAY}Cancelled${NC}\n"
+            fi
+            ;;
+    esac
+}
+
+exec_image_action() {
+    local image="$1"
+    local action="$2"
+
+    case "$action" in
+        "Inspect")
+            docker image inspect "$image" 2>/dev/null | format_json | less -R
+            ;;
+        "History")
+            docker image history "$image" 2>/dev/null | less -R
+            ;;
+        "Tag")
+            printf "${YELLOW}New tag (repo:tag): ${NC}"
+            local new_tag
+            read -r new_tag </dev/tty
+            if [[ -n "$new_tag" ]]; then
+                docker tag "$image" "$new_tag" \
+                    && printf "${GREEN}Tagged %s as %s${NC}\n" "$image" "$new_tag" \
+                    || printf "${RED}Tag failed${NC}\n"
+            else
+                printf "${GRAY}Cancelled${NC}\n"
+            fi
+            ;;
+        "Remove")
+            printf "${YELLOW}Remove image %s? [y/N] ${NC}" "$image"
+            local confirm
+            read -r confirm </dev/tty
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                docker rmi "$image" \
+                    && printf "${GREEN}Removed %s${NC}\n" "$image" \
+                    || printf "${RED}Remove failed — image may be in use${NC}\n"
+            else
+                printf "${GRAY}Cancelled${NC}\n"
+            fi
+            ;;
+    esac
+}
+
+exec_volume_action() {
+    local volume="$1"
+    local action="$2"
+
+    case "$action" in
+        "Inspect")
+            docker volume inspect "$volume" 2>/dev/null | format_json | less -R
+            ;;
+        "Remove")
+            printf "${YELLOW}Remove volume %s? [y/N] ${NC}" "$volume"
+            local confirm
+            read -r confirm </dev/tty
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                docker volume rm "$volume" \
+                    && printf "${GREEN}Removed %s${NC}\n" "$volume" \
+                    || printf "${RED}Remove failed — volume may be in use${NC}\n"
+            else
+                printf "${GRAY}Cancelled${NC}\n"
+            fi
+            ;;
+    esac
+}
+
+exec_network_action() {
+    local network="$1"
+    local action="$2"
+
+    case "$action" in
+        "Inspect")
+            docker network inspect "$network" 2>/dev/null | format_json | less -R
+            ;;
+        "Remove")
+            printf "${YELLOW}Remove network %s? [y/N] ${NC}" "$network"
+            local confirm
+            read -r confirm </dev/tty
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                docker network rm "$network" \
+                    && printf "${GREEN}Removed %s${NC}\n" "$network" \
+                    || printf "${RED}Remove failed — network may be in use${NC}\n"
+            else
+                printf "${GRAY}Cancelled${NC}\n"
+            fi
+            ;;
+    esac
+}
+
+# ── Prune ────────────────────────────────────────────────────────────
+run_prune() {
+    local target
+    target=$(printf '%s\n' \
+        "Containers  — remove all stopped containers" \
+        "Images      — remove dangling images" \
+        "Volumes     — remove unused volumes" \
+        "Networks    — remove unused networks" \
+        "System      — remove all unused resources" \
+        | fzf "${FZF_SINGLE[@]}" --header="Prune Docker resources" --prompt="prune > ") || return 1
+
+    local label
+    case "$target" in
+        Containers*) label="stopped containers"    ;;
+        Images*)     label="dangling images"       ;;
+        Volumes*)    label="unused volumes"        ;;
+        Networks*)   label="unused networks"       ;;
+        System*)     label="all unused resources"  ;;
+        *)           return 1 ;;
+    esac
+
+    printf "${YELLOW}Prune %s? This cannot be undone. [y/N] ${NC}" "$label"
+    local confirm
+    read -r confirm </dev/tty
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        printf "${GRAY}Cancelled${NC}\n"
+        return 0
+    fi
+
+    printf "${GREEN}Pruning %s...${NC}\n" "$label"
+    case "$target" in
+        Containers*) docker container prune -f ;;
+        Images*)     docker image prune -f     ;;
+        Volumes*)    docker volume prune -f    ;;
+        Networks*)   docker network prune -f   ;;
+        System*)     docker system prune -f    ;;
+    esac || printf "${RED}Prune failed${NC}\n"
+}
+
+# ── Main loop ───────────────────────────────────────────────────────
+main() {
+    check_deps
+
+    local version
+    version=$(docker version --format '{{.Server.Version}}' 2>/dev/null) || version="unknown"
+
+    printf "${GREEN}docker-fuzzy${NC} ${GRAY}— Docker browser${NC}\n"
+    printf "${GRAY}Docker:${NC} %s\n\n" "$version"
+
+    while true; do
+        local type
+        type=$(pick_resource_type) || break
+
+        if [[ "$type" == "Prune..." ]]; then
+            run_prune
+            printf "\n"
+            continue
+        fi
+
+        while true; do
+            local resource
+            case "$type" in
+                Containers) resource=$(pick_container) || break ;;
+                Images)     resource=$(pick_image)     || break ;;
+                Volumes)    resource=$(pick_volume)    || break ;;
+                Networks)   resource=$(pick_network)   || break ;;
+                *)          break ;;
+            esac
+
+            while true; do
+                local action
+                action=$(pick_action "$type" "$resource") || break
+
+                case "$type" in
+                    Containers) exec_container_action "$resource" "$action" ;;
+                    Images)     exec_image_action     "$resource" "$action" ;;
+                    Volumes)    exec_volume_action    "$resource" "$action" ;;
+                    Networks)   exec_network_action   "$resource" "$action" ;;
+                esac
+                printf "\n"
+            done
+        done
+    done
+}
+
+main
