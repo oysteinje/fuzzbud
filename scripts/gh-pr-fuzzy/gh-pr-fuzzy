@@ -478,7 +478,11 @@ show_checks() {
 }
 
 show_diff() {
-    gh pr diff "$1" --repo "$REPO" 2>&1 | less -R
+    if command -v delta &>/dev/null; then
+        gh pr diff "$1" --repo "$REPO" 2>&1 | delta
+    else
+        gh pr diff "$1" --repo "$REPO" --color always 2>&1 | less -R
+    fi
 }
 
 show_comments() {
