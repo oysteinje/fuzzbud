@@ -1,0 +1,719 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# gh-pr-fuzzy — Fast GitHub pull request browser from the terminal
+# =============================================================================
+
+# $'...' so the variables hold real ESC bytes and render whether they're passed
+# via printf format strings, `%s` value slots, fzf --header, or awk -v.
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[0;33m'
+GRAY=$'\033[90m'
+CYAN_BOLD=$'\033[1;36m'
+GREEN_BOLD=$'\033[1;32m'
+BOLD=$'\033[1m'
+NC=$'\033[0m'
+
+# ── fzf setup ──────────────────────────────────────────────────────────
+_fzf_ver=$(fzf --version 2>/dev/null | awk '{print $1}')
+if printf '%s\n' "0.30.0" "$_fzf_ver" | sort -V -C 2>/dev/null; then
+    FZF_COMMON=(--height=~60% --border --margin=1,2 --ansi)
+else
+    FZF_COMMON=(--height=60% --border --margin=1,2 --ansi)
+fi
+unset _fzf_ver
+FZF_SINGLE=("${FZF_COMMON[@]}" --no-multi)
+
+# ── Defaults ───────────────────────────────────────────────────────────
+STATE="open"
+LIMIT=100
+AUTHOR=""
+SEARCH=""
+INCLUDE_DRAFT=0
+NEEDS_REVIEW=0
+REPO=""
+
+# Fixed column widths so header alignment survives reload() with different data.
+COL_W_NUM=7      # "#123456"
+COL_W_STATE=6    # "MERGED", "CLOSED"
+COL_W_AUTHOR=20
+COL_W_CHECKS=6   # header "CHECKS"
+COL_W_REVIEW=7   # "CHANGES"
+COL_W_REVIEWER=20
+COL_W_UPDATED=10 # "YYYY-MM-DD"
+
+# ── Helpers ────────────────────────────────────────────────────────────
+die() {
+    local msg="$1"
+    local code="${2:-1}"
+    printf "${RED}Error: %s${NC}\n" "$msg" >&2
+    exit "$code"
+}
+
+usage() {
+    cat <<'EOF'
+Usage: gh-pr-fuzzy [options] [owner/repo]
+
+Browse GitHub pull requests interactively with fzf.
+
+Options:
+  -s, --state STATE   Filter by state: open (default), closed, merged, all
+  -a, --all           Shorthand for --state all
+  -d, --draft         Include draft PRs (hidden by default)
+  -m, --mine          Show only your PRs (shorthand for --author @me)
+  -A, --author USER   Filter by author (GitHub username)
+  -S, --search QUERY  Search PR titles
+  -r, --needs-review  Show only PRs where your review is requested
+  -l, --limit N       Max PRs to fetch (default: 100)
+  -h, --help          Show this help
+
+Keybindings (in PR list):
+  Enter                Select PR and open action menu
+  Ctrl-O               Open selected PR in browser
+  Ctrl-R               Reload PR list
+  Ctrl-F               Open filter sub-prompt (toggle state/mine/drafts/…)
+
+Examples:
+  gh-pr-fuzzy                          Open PRs in current repo
+  gh-pr-fuzzy -a                       All PRs
+  gh-pr-fuzzy -m                       Your open PRs
+  gh-pr-fuzzy -r                       PRs awaiting your review
+  gh-pr-fuzzy -A octocat               Open PRs by octocat
+  gh-pr-fuzzy -s merged owner/repo     Merged PRs in owner/repo
+  gh-pr-fuzzy -S "fix login"           Search open PRs by title
+EOF
+}
+
+check_deps() {
+    local missing=()
+    local deps=(fzf gh awk cut sed tr)
+
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &>/dev/null; then
+            missing+=("$dep")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        die "Missing required dependencies: $(IFS=', '; echo "${missing[*]}")"
+    fi
+}
+
+check_auth() {
+    gh auth status >/dev/null 2>&1 || die "GitHub CLI is not authenticated. Run: gh auth login"
+}
+
+resolve_repo() {
+    local repo="${1:-}"
+
+    if [[ -n "$repo" ]]; then
+        REPO="$repo"
+        return
+    fi
+
+    local detected_repo
+    detected_repo=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null) || \
+        die "Not in a GitHub repository. Pass owner/repo as an argument."
+    REPO="$detected_repo"
+}
+
+# ── State file (shared between outer script and fzf reload subshells) ──
+state_save() {
+    local f="$GPF_STATE_FILE"
+    {
+        # %q shell-quotes values so spaces, quotes, etc. survive round-trips.
+        printf 'STATE=%q\n' "$STATE"
+        printf 'LIMIT=%q\n' "$LIMIT"
+        printf 'AUTHOR=%q\n' "$AUTHOR"
+        printf 'SEARCH=%q\n' "$SEARCH"
+        printf 'INCLUDE_DRAFT=%q\n' "$INCLUDE_DRAFT"
+        printf 'NEEDS_REVIEW=%q\n' "$NEEDS_REVIEW"
+        printf 'REPO=%q\n' "$REPO"
+    } >"$f"
+}
+
+state_load() {
+    [[ -n "${GPF_STATE_FILE:-}" && -r "$GPF_STATE_FILE" ]] || return 0
+    # shellcheck disable=SC1090
+    source "$GPF_STATE_FILE"
+}
+
+# ── Editor & clipboard helpers ─────────────────────────────────────────
+editor_cmd() {
+    printf '%s' "${VISUAL:-${EDITOR:-vi}}"
+}
+
+# Compose body in $EDITOR. Writes the non-empty content to stdout,
+# returns non-zero if the buffer is empty (cancelled).
+compose_body() {
+    local banner="$1"
+    local tmp
+    tmp=$(mktemp) || return 1
+    {
+        printf '\n'
+        printf '# %s\n' "$banner"
+        printf '# Lines starting with # are ignored. Save empty to cancel.\n'
+    } >"$tmp"
+
+    "$(editor_cmd)" "$tmp" </dev/tty >/dev/tty 2>&1 || { rm -f "$tmp"; return 1; }
+
+    local body
+    body=$(grep -v '^[[:space:]]*#' "$tmp" | sed -e 's/[[:space:]]*$//' | awk 'NF { found=1 } { print } END { exit !found }') || {
+        rm -f "$tmp"
+        return 1
+    }
+
+    rm -f "$tmp"
+    printf '%s' "$body"
+}
+
+clipboard_copy() {
+    local value="$1"
+    if command -v wl-copy >/dev/null 2>&1; then
+        printf '%s' "$value" | wl-copy
+    elif command -v xclip >/dev/null 2>&1; then
+        printf '%s' "$value" | xclip -selection clipboard
+    elif command -v xsel >/dev/null 2>&1; then
+        printf '%s' "$value" | xsel --clipboard --input
+    elif command -v pbcopy >/dev/null 2>&1; then
+        printf '%s' "$value" | pbcopy
+    else
+        return 1
+    fi
+}
+
+# ── Internal: fzf preview calls this ───────────────────────────────────
+_show_preview() {
+    local pr="$1"
+    local repo="$2"
+    gh pr view "$pr" --repo "$repo" --json \
+        title,number,state,isDraft,author,headRefName,baseRefName,mergeable,reviewDecision,updatedAt,body,commits,statusCheckRollup,labels,reviews,reviewRequests,files \
+        -q '
+            "PR #\(.number) — \(.title)",
+            "State:     \(.state)\(if .isDraft then " (draft)" else "" end)",
+            "Author:    \(.author.login // "unknown")",
+            "Branch:    \(.headRefName) → \(.baseRefName)",
+            "Mergeable: \(.mergeable // "UNKNOWN")",
+            "Review:    \(.reviewDecision // "-")",
+            "Reviewers: \(
+                ([ (.reviews // [])[]
+                   | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "COMMENTED")
+                   | "\(.author.login // "?") (\(.state | ascii_downcase))" ]
+                 | unique | join(", ")) as $done |
+                ([ (.reviewRequests // [])[]
+                   | (.login // .name // "?") ] | join(", ")) as $pending |
+                if ($done | length) > 0 and ($pending | length) > 0 then "\($done)  ⏳ \($pending)"
+                elif ($done | length) > 0 then $done
+                elif ($pending | length) > 0 then "⏳ \($pending)"
+                else "-" end)",
+            "Updated:   \(.updatedAt | split("T")[0])",
+            "Commits:   \(.commits | length)",
+            "Checks:    \(if (.statusCheckRollup | length) == 0 then "none"
+                         else ([.statusCheckRollup[] | "\(.name // "?"): \(.conclusion // .status // "pending")"] | join("\n           ")) end)",
+            "Labels:    \(if (.labels | length) == 0 then "-"
+                         else ([.labels[].name] | join(", ")) end)",
+            "Files:     \(
+                (.files // []) as $all |
+                ($all | length) as $n |
+                if $n == 0 then "-"
+                else
+                    ($all | map(.path) | .[0:10]) as $shown |
+                    ($shown | join("\n           ")) as $list |
+                    if $n > 10 then "\($n) changed\n           \($list)\n           (+\($n - 10) more)"
+                    else "\($n) changed\n           \($list)" end
+                end)",
+            "",
+            (.body // "No description")
+        ' 2>/dev/null | head -80
+}
+
+# ── PR listing ─────────────────────────────────────────────────────────
+list_prs() {
+    local gh_args=(--repo "$REPO" --limit "$LIMIT" --json
+        number,title,state,isDraft,headRefName,author,updatedAt,statusCheckRollup,reviewDecision,reviews,reviewRequests)
+
+    if [[ "$STATE" == "all" ]]; then
+        gh_args+=(--state all)
+    else
+        gh_args+=(--state "$STATE")
+    fi
+
+    [[ -n "$AUTHOR" ]] && gh_args+=(--author "$AUTHOR")
+
+    # Compose --search: explicit user query + optional "needs my review" filter
+    local search="$SEARCH"
+    if [[ "$NEEDS_REVIEW" -eq 1 ]]; then
+        if [[ -n "$search" ]]; then
+            search="$search review-requested:@me"
+        else
+            search="review-requested:@me"
+        fi
+    fi
+    [[ -n "$search" ]] && gh_args+=(--search "$search")
+
+    local draft_filter=""
+    if [[ "$INCLUDE_DRAFT" -eq 0 ]]; then
+        draft_filter='| map(select(.isDraft | not))'
+    fi
+
+    local jq_query
+    jq_query=". ${draft_filter}"
+    jq_query+=' | .[] | [
+        (.number | tostring),
+        (if .isDraft then "DRAFT"
+         elif .state == "OPEN" then "OPEN"
+         elif .state == "MERGED" then "MERGED"
+         elif .state == "CLOSED" then "CLOSED"
+         else .state // "?" end),
+        (.author.login // "unknown"),
+        (if (.statusCheckRollup | length) == 0 then "-"
+         elif any(.statusCheckRollup[]?; .conclusion == "FAILURE" or .conclusion == "TIMED_OUT" or .conclusion == "ACTION_REQUIRED" or .conclusion == "CANCELLED" or .conclusion == "STARTUP_FAILURE" or .conclusion == "STALE") then "FAIL"
+         elif any(.statusCheckRollup[]?; .status == "IN_PROGRESS" or .status == "QUEUED" or .status == "PENDING" or .conclusion == null) then "WAIT"
+         else "PASS" end),
+        (.reviewDecision // "-" | if . == "APPROVED" then "OK"
+         elif . == "CHANGES_REQUESTED" then "CHANGES"
+         elif . == "REVIEW_REQUIRED" then "REVIEW"
+         else "-" end),
+        ([ (.reviews // [])[]
+           | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED")
+           | .author.login // "?" ] | unique) as $revs |
+        ([ (.reviewRequests // [])[] | .login // .name // "?" ]) as $reqs |
+        (if ($revs | length) > 0 then ($revs | join(","))
+         elif ($reqs | length) > 0 then ($reqs | join(","))
+         else "-" end),
+        (.updatedAt | split("T")[0]),
+        (.title | gsub("[\\t\\r\\n]+"; " "))
+    ] | @tsv'
+
+    gh pr list "${gh_args[@]}" -q "$jq_query"
+}
+
+# Render colored, fixed-width data rows from TSV on stdin. No header.
+_format_rows() {
+    awk -F'\t' \
+        -v green="${GREEN}" -v green_bold="${GREEN_BOLD}" -v cyan_bold="${CYAN_BOLD}" \
+        -v gray="${GRAY}" -v yellow="${YELLOW}" -v red="${RED}" -v nc="${NC}" \
+        -v w1="$COL_W_NUM" -v w2="$COL_W_STATE" -v w3="$COL_W_AUTHOR" \
+        -v w4="$COL_W_CHECKS" -v w5="$COL_W_REVIEW" -v w6="$COL_W_REVIEWER" \
+        -v w7="$COL_W_UPDATED" \
+    '{
+        # Truncate text columns that can exceed fixed width.
+        if (length($3) > w3) $3 = substr($3, 1, w3-1) "…"
+        if (length($6) > w6) $6 = substr($6, 1, w6-1) "…"
+
+        sc = gray
+        if ($2 == "OPEN")        sc = green
+        else if ($2 == "DRAFT")  sc = yellow
+        else if ($2 == "MERGED") sc = cyan_bold
+        else if ($2 == "CLOSED") sc = red
+
+        cc = gray
+        if ($4 == "PASS")        cc = green
+        else if ($4 == "FAIL")   cc = red
+        else if ($4 == "WAIT")   cc = yellow
+
+        rc = gray
+        if ($5 == "OK")          rc = green
+        else if ($5 == "CHANGES") rc = red
+        else if ($5 == "REVIEW") rc = yellow
+
+        vc = ($6 == "-") ? gray : cyan_bold
+
+        # Ready-to-merge: bold-green the PR number column (PASS + OK).
+        ready = ($4 == "PASS" && $5 == "OK")
+        nc_color = ready ? green_bold : ""
+        nc_reset = ready ? nc : ""
+        num_text = "#" $1
+        num_pad = w1 - length(num_text)
+        if (num_pad < 0) num_pad = 0
+
+        printf "%s%-*s%s  %s%-*s%s  %-*s  %s%-*s%s  %s%-*s%s  %s%-*s%s  %-*s  %s\n",
+            nc_color, w1, num_text, nc_reset,
+            sc, w2, $2, nc,
+            w3, $3,
+            cc, w4, $4, nc,
+            rc, w5, $5, nc,
+            vc, w6, $6, nc,
+            w7, $7,
+            $8
+    }'
+}
+
+_build_header_line() {
+    # Column labels, fixed widths matching _format_rows
+    printf "%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %s" \
+        "$COL_W_NUM"     "#" \
+        "$COL_W_STATE"   "STATE" \
+        "$COL_W_AUTHOR"  "AUTHOR" \
+        "$COL_W_CHECKS"  "CHECKS" \
+        "$COL_W_REVIEW"  "REVIEW" \
+        "$COL_W_REVIEWER" "REVIEWER" \
+        "$COL_W_UPDATED" "UPDATED" \
+        "TITLE"
+}
+
+# ── Filter sub-prompt (Ctrl-F) ─────────────────────────────────────────
+_cycle_state() {
+    case "$STATE" in
+        open)    STATE="merged" ;;
+        merged)  STATE="closed" ;;
+        closed)  STATE="all" ;;
+        *)       STATE="open" ;;
+    esac
+}
+
+_choose_filter() {
+    state_load
+    local lines
+    lines=$(printf '%s\n' \
+        "state         $STATE" \
+        "mine          $([[ "$AUTHOR" == "@me" ]] && echo on || echo off)" \
+        "drafts        $([[ "$INCLUDE_DRAFT" -eq 1 ]] && echo shown || echo hidden)" \
+        "review of me  $([[ "$NEEDS_REVIEW" -eq 1 ]] && echo on || echo off)" \
+        "search        ${SEARCH:-(none)}" \
+        "author        ${AUTHOR:-(none)}" \
+        "limit         $LIMIT" \
+    )
+
+    local pick
+    pick=$(printf '%s\n' "$lines" \
+        | fzf "${FZF_SINGLE[@]}" \
+            --header="Toggle / set a filter (Esc = cancel)" \
+            --prompt="filter > ") || return 0
+
+    case "$pick" in
+        "state "*)          _cycle_state ;;
+        "mine "*)           [[ "$AUTHOR" == "@me" ]] && AUTHOR="" || AUTHOR="@me" ;;
+        "drafts "*)         INCLUDE_DRAFT=$(( 1 - INCLUDE_DRAFT )) ;;
+        "review of me "*)   NEEDS_REVIEW=$(( 1 - NEEDS_REVIEW )) ;;
+        "search "*)
+            printf "${YELLOW}Search query${NC} (empty to clear): " >/dev/tty
+            local q
+            IFS= read -r q </dev/tty || true
+            SEARCH="$q"
+            ;;
+        "author "*)
+            printf "${YELLOW}Author username${NC} (empty to clear, or @me): " >/dev/tty
+            local a
+            IFS= read -r a </dev/tty || true
+            AUTHOR="$a"
+            ;;
+        "limit "*)
+            printf "${YELLOW}Limit${NC} (current: $LIMIT): " >/dev/tty
+            local l
+            IFS= read -r l </dev/tty || true
+            [[ "$l" =~ ^[0-9]+$ ]] && LIMIT="$l"
+            ;;
+    esac
+
+    state_save
+}
+
+# ── PR picker ──────────────────────────────────────────────────────────
+pick_pr() {
+    local self="$0"
+
+    local header_cols header_legend
+    header_cols=$(_build_header_line)
+    header_legend="${GRAY}↵ actions   ^O browser   ^R refresh   ^F filters${NC}"
+
+    local fzf_header
+    fzf_header=$(printf '%s\n%s' "$header_cols" "$header_legend")
+
+    # Seed initial list. If empty on first launch, exit with a helpful message;
+    # after reload() the empty case will just show an empty fzf list.
+    local initial
+    initial=$(list_prs | _format_rows) || return 1
+    if [[ -z "$initial" ]]; then
+        die "No pull requests found (state=$STATE)"
+    fi
+
+    local selection
+    selection=$(printf '%s\n' "$initial" \
+        | fzf "${FZF_SINGLE[@]}" \
+            --layout=reverse \
+            --header="${fzf_header}" \
+            --prompt="pr > " \
+            --preview="'$self' --_preview {1} '$REPO'" \
+            --preview-window=down:50%:wrap \
+            --bind="ctrl-o:execute-silent(PR=\$(printf '%s' {1} | tr -d '#'); gh pr view \"\$PR\" --repo '$REPO' --web 2>/dev/null &)" \
+            --bind="ctrl-r:reload('$self' --_list)" \
+            --bind="ctrl-f:execute('$self' --_filter)+reload('$self' --_list)" \
+        ) || return 1
+
+    # Strip ANSI, then take the first whitespace-delimited field (#<num>).
+    printf '%s\n' "$selection" | sed -E 's/\x1b\[[0-9;]*m//g' | awk '{print $1}' | tr -d '#'
+}
+
+# ── Action picker ──────────────────────────────────────────────────────
+pick_action() {
+    local action
+    action=$(printf '%s\n' \
+        "summary" \
+        "diff" \
+        "checks" \
+        "comments" \
+        "comment" \
+        "review" \
+        "checkout" \
+        "merge" \
+        "copy-url" \
+        "copy-branch" \
+        "browser" \
+        | fzf "${FZF_SINGLE[@]}" \
+            --header="PR #$1 — select action (Esc=back)" \
+            --prompt="action > ") || return 1
+    printf '%s\n' "$action"
+}
+
+# ── Actions ────────────────────────────────────────────────────────────
+show_summary() {
+    gh pr view "$1" --repo "$REPO" | less -R
+}
+
+show_checks() {
+    gh pr checks "$1" --repo "$REPO" 2>&1 | less -R
+}
+
+show_diff() {
+    gh pr diff "$1" --repo "$REPO" 2>&1 | less -R
+}
+
+show_comments() {
+    gh pr view "$1" --repo "$REPO" --comments 2>&1 | less -R
+}
+
+comment_pr() {
+    local body
+    body=$(compose_body "Add a comment to PR #$1") || {
+        printf "${GRAY}Cancelled (empty comment)${NC}\n"
+        return
+    }
+    if printf '%s\n' "$body" | gh pr comment "$1" --repo "$REPO" -F -; then
+        printf "${GREEN}Comment posted on PR #%s${NC}\n" "$1"
+    else
+        printf "${RED}Comment failed${NC}\n"
+    fi
+}
+
+review_pr() {
+    local kind
+    kind=$(printf '%s\n' "approve" "request-changes" "comment-only" \
+        | fzf "${FZF_SINGLE[@]}" \
+            --header="PR #$1 — review kind (Esc=back)" \
+            --prompt="review > ") || return
+
+    case "$kind" in
+        approve)
+            printf "${YELLOW}Approve PR #%s? [y/N] ${NC}" "$1"
+            local confirm
+            read -r confirm </dev/tty
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                gh pr review "$1" --repo "$REPO" --approve \
+                    && printf "${GREEN}Approved PR #%s${NC}\n" "$1" \
+                    || printf "${RED}Approve failed${NC}\n"
+            else
+                printf "${GRAY}Cancelled${NC}\n"
+            fi
+            ;;
+        request-changes|comment-only)
+            local body flag
+            if [[ "$kind" == "request-changes" ]]; then
+                flag="--request-changes"
+            else
+                flag="--comment"
+            fi
+            body=$(compose_body "Body for '$kind' review on PR #$1") || {
+                printf "${GRAY}Cancelled (empty body)${NC}\n"
+                return
+            }
+            if printf '%s\n' "$body" | gh pr review "$1" --repo "$REPO" "$flag" --body-file -; then
+                printf "${GREEN}Review (%s) posted on PR #%s${NC}\n" "$kind" "$1"
+            else
+                printf "${RED}Review failed${NC}\n"
+            fi
+            ;;
+    esac
+}
+
+merge_pr() {
+    local strategy
+    strategy=$(printf '%s\n' "squash" "merge" "rebase" \
+        | fzf "${FZF_SINGLE[@]}" \
+            --header="PR #$1 — merge strategy (Esc=back)" \
+            --prompt="strategy > ") || return
+
+    printf "${YELLOW}Merge PR #%s using %s? [y/N] ${NC}" "$1" "$strategy"
+    local confirm
+    read -r confirm </dev/tty
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        gh pr merge "$1" --repo "$REPO" --"$strategy" \
+            && printf "${GREEN}Merged PR #%s (%s)${NC}\n" "$1" "$strategy" \
+            || printf "${RED}Merge failed${NC}\n"
+    else
+        printf "${GRAY}Cancelled${NC}\n"
+    fi
+}
+
+checkout_pr() {
+    gh pr checkout "$1" --repo "$REPO"
+}
+
+open_browser() {
+    gh pr view "$1" --repo "$REPO" --web
+}
+
+copy_pr_url() {
+    local url
+    url=$(gh pr view "$1" --repo "$REPO" --json url -q '.url' 2>/dev/null) || {
+        printf "${RED}Could not fetch PR URL${NC}\n"
+        return
+    }
+    if clipboard_copy "$url"; then
+        printf "${GREEN}Copied${NC} ${GRAY}%s${NC}\n" "$url"
+    else
+        printf "${YELLOW}No clipboard tool found${NC} (install wl-copy/xclip/xsel/pbcopy)\n"
+        printf "${GRAY}URL: %s${NC}\n" "$url"
+    fi
+}
+
+copy_pr_branch() {
+    local branch
+    branch=$(gh pr view "$1" --repo "$REPO" --json headRefName -q '.headRefName' 2>/dev/null) || {
+        printf "${RED}Could not fetch branch name${NC}\n"
+        return
+    }
+    if clipboard_copy "$branch"; then
+        printf "${GREEN}Copied${NC} ${GRAY}%s${NC}\n" "$branch"
+    else
+        printf "${YELLOW}No clipboard tool found${NC} (install wl-copy/xclip/xsel/pbcopy)\n"
+        printf "${GRAY}Branch: %s${NC}\n" "$branch"
+    fi
+}
+
+# ── CLI parsing ────────────────────────────────────────────────────────
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            # Internal: fzf preview callback
+            --_preview)
+                local pr_num repo
+                pr_num=$(printf '%s' "${2:-}" | tr -d '#')
+                repo="${3:-}"
+                _show_preview "$pr_num" "$repo"
+                exit 0
+                ;;
+            # Internal: fzf reload callback — emit formatted data rows
+            --_list)
+                state_load
+                list_prs | _format_rows
+                exit 0
+                ;;
+            # Internal: filter sub-prompt invoked by Ctrl-F
+            --_filter)
+                _choose_filter
+                exit 0
+                ;;
+            -s|--state)
+                [[ $# -ge 2 ]] || die "--state requires a value (open, closed, merged, all)"
+                STATE="$2"
+                shift 2
+                ;;
+            -a|--all)
+                STATE="all"
+                shift
+                ;;
+            -d|--draft)
+                INCLUDE_DRAFT=1
+                shift
+                ;;
+            -m|--mine)
+                AUTHOR="@me"
+                shift
+                ;;
+            -A|--author)
+                [[ $# -ge 2 ]] || die "--author requires a GitHub username"
+                AUTHOR="$2"
+                shift 2
+                ;;
+            -S|--search)
+                [[ $# -ge 2 ]] || die "--search requires a query string"
+                SEARCH="$2"
+                shift 2
+                ;;
+            -r|--needs-review)
+                NEEDS_REVIEW=1
+                shift
+                ;;
+            -l|--limit)
+                [[ $# -ge 2 ]] || die "--limit requires a number"
+                LIMIT="$2"
+                shift 2
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -*)
+                die "Unknown option: $1. Run 'gh-pr-fuzzy --help' for usage."
+                ;;
+            *)
+                # Positional: owner/repo
+                REPO="$1"
+                shift
+                ;;
+        esac
+    done
+}
+
+# ── Main ───────────────────────────────────────────────────────────────
+main() {
+    parse_args "$@"
+
+    # Internal subcommands exit inside parse_args; reaching here means interactive mode.
+    check_deps
+    check_auth
+    resolve_repo "$REPO"
+
+    # Shared state file for the main fzf session and its reload subshells.
+    GPF_STATE_FILE="${TMPDIR:-/tmp}/gh-pr-fuzzy.$$.state"
+    export GPF_STATE_FILE
+    trap 'rm -f "$GPF_STATE_FILE"' EXIT
+    state_save
+
+    printf "${GREEN}gh-pr-fuzzy${NC} ${GRAY}— %s${NC}  ${GRAY}repo: %s${NC}\n\n" "$STATE" "$REPO"
+
+    while true; do
+        # Re-load state so any filter changes from Ctrl-F persist into the outer loop.
+        state_load
+
+        local pr
+        pr=$(pick_pr) || exit 0
+        [[ -n "$pr" ]] || continue
+
+        while true; do
+            local action
+            action=$(pick_action "$pr") || break
+
+            case "$action" in
+                summary)     show_summary   "$pr" ;;
+                diff)        show_diff      "$pr" ;;
+                checks)      show_checks    "$pr" ;;
+                comments)    show_comments  "$pr" ;;
+                comment)     comment_pr     "$pr" ;;
+                review)      review_pr      "$pr" ;;
+                checkout)    checkout_pr    "$pr" ;;
+                merge)       merge_pr       "$pr" ;;
+                copy-url)    copy_pr_url    "$pr" ;;
+                copy-branch) copy_pr_branch "$pr" ;;
+                browser)     open_browser   "$pr" ;;
+            esac
+
+            printf '\n'
+        done
+    done
+}
+
+main "$@"
