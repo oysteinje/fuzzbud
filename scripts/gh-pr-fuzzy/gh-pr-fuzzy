@@ -19,9 +19,9 @@ NC=$'\033[0m'
 # ── fzf setup ──────────────────────────────────────────────────────────
 _fzf_ver=$(fzf --version 2>/dev/null | awk '{print $1}')
 if printf '%s\n' "0.30.0" "$_fzf_ver" | sort -V -C 2>/dev/null; then
-    FZF_COMMON=(--height=~60% --border --margin=1,2 --ansi)
+    FZF_COMMON=(--height=~80% --min-height=20 --border --margin=1,2 --ansi)
 else
-    FZF_COMMON=(--height=60% --border --margin=1,2 --ansi)
+    FZF_COMMON=(--height=80% --border --margin=1,2 --ansi)
 fi
 unset _fzf_ver
 FZF_SINGLE=("${FZF_COMMON[@]}" --no-multi)
