@@ -60,8 +60,14 @@ done
 require_cmd chmod
 require_cmd mktemp
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOCAL_SOURCE="${SCRIPT_DIR}/fuzzbud"
+# When piped (curl ... | bash) BASH_SOURCE is empty; fall back so set -u
+# doesn't abort and so we don't mistake the cwd for a local checkout.
+if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    LOCAL_SOURCE="${SCRIPT_DIR}/fuzzbud"
+else
+    LOCAL_SOURCE=""
+fi
 
 TMP_FILE="$(mktemp)"
 trap 'rm -f "$TMP_FILE"' EXIT
